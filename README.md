@@ -20,7 +20,9 @@ Automated reroller for Taimanin Squad that detects star ratings on character car
    Download from [python.org](https://www.python.org/downloads/)
 
 2. **Install required libraries**
+```bash
 -m pip install -r requirements.txt
+```
 or
 ```bash
    pip install opencv-python numpy pyautogui scikit-learn keyboard pillow
