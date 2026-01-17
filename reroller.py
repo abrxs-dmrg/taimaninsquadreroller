@@ -14,14 +14,18 @@ import keyboard
 # COMMAND LINE ARGUMENTS
 # -----------------------------
 parser = argparse.ArgumentParser(description='Gacha reroller with Character Detection')
+parser.add_argument('-max_attempts', type=int, default=9999999, help='Maximum number of reroll attempts')
 parser.add_argument('-min_5_star_cards', type=int, default=3, help='Minimum number of 5* cards required')
-parser.add_argument('-match_threshold', type=float, default=0.80, help='Template matching confidence threshold')
+parser.add_argument('-match_threshold', type=float, default=0.95, help='Template matching confidence threshold')
+parser.add_argument('-debug_mode', type=str, default='false', choices=['true', 'false'], help='Save screenshots')
 parser.add_argument('-roll_delay', type=float, default=3.0, help='Delay after clicking the button')
+parser.add_argument('-screenshot_dir', type=str, default='debug_logs', help='Where to save screenshots')
+parser.add_argument('-exit_key', type=str, default='esc', help='Key to stop the script')
 args = parser.parse_args()
 
 # Directory Setups
 TARGET_CHARS_DIR = 'target_characters'
-DEBUG_DIR = 'debug_logs'
+DEBUG_DIR = args.screenshot_dir
 for d in [TARGET_CHARS_DIR, DEBUG_DIR]: os.makedirs(d, exist_ok=True)
 
 # Template Patterns
@@ -113,30 +117,27 @@ def check_victory(screen_gray, star_pts, star_shape, target_temps):
     target_is_high_tier = False
     target_name_found = "None"
     
+    target_info = None
+    
     if target_temps:
         char_pts, char_shape, char_name, _ = find_scaled(screen_gray, target_temps, 0.80)
         for (cx, cy) in char_pts:
             for fx in five_star_columns:
-                # # Margin of 150px to align character with star column
                 if abs(cx - fx) < 150:
                     target_is_high_tier = True
                     target_name_found = char_name
+                    # position and name for debug
+                    target_info = {"name": char_name, "pos": (cx, cy), "shape": char_shape}
                     break
 
     # --- OUTPUT LOGIC ---
     if not target_temps:
-        # General Mode: Only total count matters (Non character added as target)
-        if has_enough_fives:
-            return True, f"SUCCESS: {total_fives} 5* cards found."
+        return has_enough_fives, f"Success: {total_fives} 5* cards found.", total_fives, None
     else:
-        # Specific Mode: Both conditions must be met independently
         if has_enough_fives and target_is_high_tier:
-            return True, f"¡SUCCESS!: {target_name_found} is 5* and there are {total_fives} in total."
-        
-        if target_is_high_tier and not has_enough_fives:
-            print(f"Almost: {target_name_found} is 5*, but only {total_fives}/{args.min_5_star_cards} found.")
-    
-    return False, f"Searching... (5* detected: {total_fives}/{args.min_5_star_cards})"
+            return True, f"SUCCESS!: {target_name_found} is 5* and there are {total_fives} in total.", total_fives, target_info
+            
+    return False, f"Searching... (5* detected: {total_fives}/{args.min_5_star_cards})", total_fives, target_info
 
 # -----------------------------
 # ACTIONS, AVOID BOT DETECTION RANDOMIZER
@@ -162,11 +163,12 @@ def main():
     target_temps = load_temps(os.path.join(TARGET_CHARS_DIR, "*.png"))
 
     print(f"Starting... {'Target Character Mode' if target_temps else 'General REROLL Mode'}")
+    print(f"Exit key set to: {args.exit_key.upper()}")
     attempt = 0
 
-    while not keyboard.is_pressed('esc'):
+    while attempt < args.max_attempts and not keyboard.is_pressed('esc'):
         attempt += 1
-        print(f"\n[Attempt {attempt}] Scanning...")
+        print(f"\n[Attempt {attempt}/{args.max_attempts}] Scanning...")
         
         # Capture screen
         img = pyautogui.screenshot()
@@ -177,7 +179,32 @@ def main():
         s_pts, s_shape, _, _ = find_scaled(gray, star_temps, args.match_threshold)
         
         # Validate Victory Conditions
-        success, msg = check_victory(gray, s_pts, s_shape, target_temps)
+        success, msg, fives_count, target_info = check_victory(gray, s_pts, s_shape, target_temps)
+
+        # Save screenshot if debug is active
+        if args.debug_mode == 'true':
+            debug_frame = frame.copy()
+            
+            # Draw detected stars
+            for (x, y) in s_pts:
+                cv2.rectangle(debug_frame, (x, y), (x + s_shape[1], y + s_shape[0]), (0, 255, 0), 2)
+            
+            # Draw the target
+            if target_info:
+                tx, ty = target_info["pos"]
+                tw, th = target_info["shape"][1], target_info["shape"][0]
+                # box
+                cv2.rectangle(debug_frame, (tx, ty), (tx + tw, ty + th), (255, 0, 0), 3)
+                # name
+                cv2.putText(debug_frame, f"TARGET: {target_info['name']}", (tx, ty - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+            # count text
+            cv2.putText(debug_frame, f"5* Cards: {fives_count}", (10, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
+            cv2.imwrite(f"{DEBUG_DIR}/attempt_{attempt:04d}.png", debug_frame)
+            
         print(f" -> {msg}")
 
         if success:
@@ -193,6 +220,8 @@ def main():
         else:
             print("Retrying scan...")
             time.sleep(2)
+    if attempt >= args.max_attempts:
+        print(f"\nMaximum attempts ({args.max_attempts}) reached. Stopping script.")
 
 if __name__ == "__main__":
     main()
