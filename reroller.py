@@ -4,419 +4,224 @@ import pyautogui
 import time
 import os
 import sys
-import signal
 import glob
 import argparse
+import random
 from sklearn.cluster import DBSCAN
-import keyboard  # pip install keyboard
+import keyboard
 
 # -----------------------------
 # COMMAND LINE ARGUMENTS
 # -----------------------------
-parser = argparse.ArgumentParser(
-    description='Automated reroller for gacha game recruitment',
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog="""
-Examples:
-  python reroller.py
-  python reroller.py -max_attempts 50 -min_5_star_cards 2
-  python reroller.py -debug_mode true -match_threshold 0.75
-  python reroller.py -roll_delay 5 -max_attempts 100
-    """
-)
-
-parser.add_argument('-max_attempts', type=int, default=9999999,
-                    help='Maximum number of reroll attempts (default: 9999999)')
-parser.add_argument('-min_5_star_cards', type=int, default=3,
-                    help='Minimum number of 5-star cards required to stop (default: 3)')
-parser.add_argument('-match_threshold', type=float, default=0.85,
-                    help='Template matching confidence threshold 0.0-1.0 (default: 0.85)')
-parser.add_argument('-debug_mode', type=str, default='false',
-                    choices=['true', 'false'],
-                    help='Enable debug mode to save screenshots (default: false)')
-parser.add_argument('-roll_delay', type=float, default=3.0,
-                    help='Seconds to wait after clicking reroll button (default: 3.0)')
-parser.add_argument('-screenshot_dir', type=str, default='screenshots',
-                    help='Directory to save debug screenshots (default: screenshots)')
-parser.add_argument('-exit_key', type=str, default='esc',
-                    help='Key to press to exit the script (default: esc)')
-
+parser = argparse.ArgumentParser(description='Gacha reroller with Character Detection')
+parser.add_argument('-max_attempts', type=int, default=9999999, help='Maximum number of reroll attempts')
+parser.add_argument('-min_5_star_cards', type=int, default=3, help='Minimum number of 5* cards required')
+parser.add_argument('-match_threshold', type=float, default=0.95, help='Template matching confidence threshold')
+parser.add_argument('-debug_mode', type=str, default='false', choices=['true', 'false'], help='Save screenshots')
+parser.add_argument('-roll_delay', type=float, default=3.0, help='Delay after clicking the button')
+parser.add_argument('-screenshot_dir', type=str, default='debug_logs', help='Where to save screenshots')
+parser.add_argument('-exit_key', type=str, default='esc', help='Key to stop the script')
 args = parser.parse_args()
 
-# -----------------------------
-# PARAMETERS
-# -----------------------------
-STAR_TEMPLATE_PATTERN = "star_template*.png"  # Matches star_template.png, star_template2.png, etc.
-BUTTON_TEMPLATE_PATTERN = "recruit_button*.png"  # Matches recruit_button.png, recruit_button2.png, etc.
+# Directory Setups
+TARGET_CHARS_DIR = 'target_characters'
+DEBUG_DIR = args.screenshot_dir
+for d in [TARGET_CHARS_DIR, DEBUG_DIR]: os.makedirs(d, exist_ok=True)
 
-ROLL_DELAY = args.roll_delay
-MAX_ATTEMPTS = args.max_attempts
-MIN_5_STAR_CARDS = args.min_5_star_cards
-MATCH_THRESHOLD = args.match_threshold
-DEBUG_MODE = args.debug_mode.lower() == 'true'
-SCREENSHOT_DIR = args.screenshot_dir
-EXIT_KEY = args.exit_key
-
-os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-
-# Print current configuration
-print("[*] Configuration:")
-print(f"    Max Attempts: {MAX_ATTEMPTS}")
-print(f"    Min 5-Star Cards: {MIN_5_STAR_CARDS}")
-print(f"    Match Threshold: {MATCH_THRESHOLD}")
-print(f"    Debug Mode: {DEBUG_MODE}")
-print(f"    Roll Delay: {ROLL_DELAY}s")
-print(f"    Screenshot Dir: {SCREENSHOT_DIR}")
-print(f"    Exit Key: {EXIT_KEY.upper()}")
-print()
+# Template Patterns
+STAR_PATTERN = "star_template*.png"
+BTN_PATTERN = "recruit_button*.png"
 
 # -----------------------------
-# LOAD ALL TEMPLATES
+# SCALE & VISION FUNCTIONS 
 # -----------------------------
-def load_templates(pattern):
-    """Load all template images matching the pattern."""
-    template_files = glob.glob(pattern)
-    templates = []
-    for file in template_files:
-        template = cv2.imread(file, cv2.IMREAD_GRAYSCALE)
-        if template is not None:
-            templates.append((file, template))
-            print(f"[*] Loaded template: {file} (size: {template.shape})")
-        else:
-            print(f"[WARNING] Could not load template: {file}")
-    return templates
-
-# Load all star and button templates at startup
-STAR_TEMPLATES = load_templates(STAR_TEMPLATE_PATTERN)
-BUTTON_TEMPLATES = load_templates(BUTTON_TEMPLATE_PATTERN)
-
-if not STAR_TEMPLATES:
-    print(f"[ERROR] No star templates found matching pattern: {STAR_TEMPLATE_PATTERN}")
-    sys.exit(1)
-
-if not BUTTON_TEMPLATES:
-    print(f"[ERROR] No button templates found matching pattern: {BUTTON_TEMPLATE_PATTERN}")
-    sys.exit(1)
-
-print(f"[*] Loaded {len(STAR_TEMPLATES)} star template(s)")
-print(f"[*] Loaded {len(BUTTON_TEMPLATES)} button template(s)\n")
-
-# -----------------------------
-# EXIT FLAG & SIGNAL HANDLING
-# -----------------------------
-should_exit = False
-
-def on_exit_key():
-    global should_exit
-    should_exit = True
-    print("\n[!] ESC pressed! Stopping script...")
-
-def signal_handler(sig, frame):
-    global should_exit
-    should_exit = True
-    print("\n[!] Ctrl+C pressed! Stopping script...")
-    keyboard.unhook_all()
-    sys.exit(0)
-
-# Set up the exit key listener and Ctrl+C handler
-keyboard.on_press_key(EXIT_KEY, lambda _: on_exit_key())
-signal.signal(signal.SIGINT, signal_handler)
-
-# -----------------------------
-# NMS FUNCTION
-# -----------------------------
-def nms(points, scores, template_size, overlap_thresh=0.3):
-    if len(points) == 0:
-        return []
-
-    boxes = []
-    for (x, y) in points:
-        boxes.append([x, y, x + template_size[0], y + template_size[1]])
-    boxes = np.array(boxes)
+def nms(points, scores, shape, overlap=0.3):
+    # Prevents counting the same star multiple times by filtering out overlapping bounding boxes.
+    if not points: return []
+    boxes = np.array([[x, y, x + shape[1], y + shape[0]] for (x, y) in points])
     scores = np.array(scores)
-
-    x1 = boxes[:,0]; y1 = boxes[:,1]; x2 = boxes[:,2]; y2 = boxes[:,3]
+    x1, y1, x2, y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
     areas = (x2 - x1 + 1) * (y2 - y1 + 1)
     order = scores.argsort()[::-1]
-
     keep = []
     while order.size > 0:
         i = order[0]
         keep.append(i)
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-
-        w = np.maximum(0.0, xx2 - xx1 + 1)
-        h = np.maximum(0.0, yy2 - yy1 + 1)
-        inter = w * h
-        ovr = inter / (areas[i] + areas[order[1:]] - inter)
-
-        inds = np.where(ovr <= overlap_thresh)[0]
-        order = order[inds + 1]
+        xx1, yy1 = np.maximum(x1[i], x1[order[1:]]), np.maximum(y1[i], y1[order[1:]])
+        xx2, yy2 = np.minimum(x2[i], x2[order[1:]]), np.minimum(y2[i], y2[order[1:]])
+        w, h = np.maximum(0.0, xx2 - xx1 + 1), np.maximum(0.0, yy2 - yy1 + 1)
+        ovr = (w * h) / (areas[i] + areas[order[1:]] - (w * h))
+        order = order[np.where(ovr <= overlap)[0] + 1]
     return [points[i] for i in keep]
 
+def find_scaled(screen_gray, templates, threshold):
+    # Searches for templates at different sizes to support various screen resolutions. This should work on different resolutions without you manually changing any parameter.
+    best_val, best_pts, best_shape, best_name = 0, [], None, None
+    for scale in np.linspace(0.6, 1.2, 7): # Soporte multi-resolución
+        for name, temp in templates:
+            w, h = int(temp.shape[1] * scale), int(temp.shape[0] * scale)
+            if h > screen_gray.shape[0] or w > screen_gray.shape[1]: continue
+            resized = cv2.resize(temp, (w, h), interpolation=cv2.INTER_AREA)
+            res = cv2.matchTemplate(screen_gray, resized, cv2.TM_CCOEFF_NORMED)
+            locs = np.where(res >= threshold)
+            pts = list(zip(*locs[::-1]))
+            if pts:
+                max_v = np.max(res)
+                if max_v > best_val:
+                    best_val, best_shape, best_name = max_v, resized.shape, name
+                    best_pts = nms(pts, [res[y, x] for x, y in pts], resized.shape)
+    return best_pts, best_shape, best_name, best_val
+
+def get_star_groups(points):
+    # Groups detected stars into individual cards using DBSCAN. Each cluster represents a char card
+    if not points: return {}
+    # 120 is the pixel distance threshold to consider stars as part of the same card, tbh this can be more adjusted with more test to avoid a bad count of stars.
+    clustering = DBSCAN(eps=120, min_samples=1).fit(points)
+    groups = {}
+    for i, label in enumerate(clustering.labels_):
+        if label not in groups: groups[label] = []
+        groups[label].append(points[i])
+    return groups
+
 # -----------------------------
-# MULTI-TEMPLATE MATCHING
+# VALIDATION LOGIC
 # -----------------------------
-def find_best_template_match(screen_gray, templates, threshold=MATCH_THRESHOLD):
+def check_victory(screen_gray, star_pts, star_shape, target_temps):
     """
-    Try all templates and return the best match that exceeds threshold.
-    Returns: (best_points, best_template_shape, best_template_name, best_max_confidence)
+    The reroll will be considered completed when the next conditions success: 
+    1. Identifies 5-star cards based on the number of star clusters.
+    2. Verifies if a specific target character occupies a 5-star slot.
     """
-    best_result = None
-    best_confidence = 0
-    best_points = []
-    best_template_shape = None
-    best_template_name = None
+    star_groups = get_star_groups(star_pts)
     
-    for template_name, template_gray in templates:
-        result = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-        locations = np.where(result >= threshold)
-        points = list(zip(*locations[::-1]))
-        
-        if points:
-            scores = [result[y, x] for x, y in points]
-            max_score = max(scores)
-            
-            if max_score > best_confidence:
-                best_confidence = max_score
-                filtered = nms(points, scores, template_gray.shape, overlap_thresh=0.3)
-                best_points = filtered
-                best_template_shape = template_gray.shape
-                best_template_name = template_name
-                best_result = result
+    # 1. Identify columns (X) of cards that are ACTUAL 5-star cards
+    # The groups must contain 5 or more detected stars
+    five_star_columns = []
+    for label, pts in star_groups.items():
+        if len(pts) >= 5:
+            avg_x = sum(p[0] for p in pts) / len(pts)
+            five_star_columns.append(avg_x)
     
-    return best_points, best_template_shape, best_template_name, best_confidence
+    total_fives = len(five_star_columns)
+    
+    # --- DEBUG ---
+    if total_fives > 0:
+        cols_str = ", ".join([f"Pos:{int(x)}" for x in five_star_columns])
+        print(f"Analysis: {total_fives} 5* cards detected at -> {cols_str}")
 
-def find_stars_on_screen():
-    screenshot = pyautogui.screenshot()
-    screen = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-    screen_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
-    
-    points, template_shape, template_name, confidence = find_best_template_match(
-        screen_gray, STAR_TEMPLATES, threshold=MATCH_THRESHOLD
-    )
-    
-    if DEBUG_MODE and template_name:
-        print(f"  [DEBUG] Using star template: {template_name} (confidence: {confidence:.3f})")
-    
-    # DEBUG: draw green rectangles for stars
-    if DEBUG_MODE and template_shape:
-        for x, y in points:
-            cv2.rectangle(screen, (x, y), 
-                         (x + template_shape[1], y + template_shape[0]), 
-                         (0, 255, 0), 2)
-    
-    return points, template_shape, screen
+    # CONDITION A: Are there enough total 5-star cards?
+    # If your searching 3 but you get 2, it is a False.
+    has_enough_fives = (total_fives >= args.min_5_star_cards)
 
-def find_button_on_screen(screen=None, save_debug=False):
-    screenshot = pyautogui.screenshot()
-    if screen is None:
-        screen = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-    screen_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
+    # CONDITION B: Is the target character one of those 5-star cards?
+    target_is_high_tier = False
+    target_name_found = "None"
     
-    # Try all button templates
-    best_match = None
-    best_confidence = 0
-    best_template_name = None
-    best_location = None
-    best_size = None
+    target_info = None
     
-    for template_name, template_gray in BUTTON_TEMPLATES:
-        result = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-        
-        if max_val > best_confidence:
-            best_confidence = max_val
-            best_template_name = template_name
-            best_location = max_loc
-            best_size = template_gray.shape[:2]
-            best_match = result
-    
-    # DEBUG: Save comparison images
-    if save_debug:
-        cv2.imwrite(f"{SCREENSHOT_DIR}/debug_screen_gray.png", screen_gray)
-        for template_name, template_gray in BUTTON_TEMPLATES:
-            safe_name = os.path.basename(template_name).replace('.png', '')
-            cv2.imwrite(f"{SCREENSHOT_DIR}/debug_template_{safe_name}.png", template_gray)
-        
-        if best_match is not None:
-            # Save heatmap of best match
-            heatmap = cv2.normalize(best_match, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-            heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-            cv2.imwrite(f"{SCREENSHOT_DIR}/debug_heatmap.png", heatmap_color)
-        
-        print(f"[DEBUG] Saved debug images to {SCREENSHOT_DIR}/")
-        print(f"[DEBUG] Best template: {best_template_name}")
-        print(f"[DEBUG] Best confidence: {best_confidence:.3f}")
-        print(f"[DEBUG] Screen size: {screen_gray.shape}")
-    
-    # DEBUG: show max confidence value
-    if DEBUG_MODE and best_confidence < MATCH_THRESHOLD:
-        print(f"  [DEBUG] Button match confidence: {best_confidence:.3f} (threshold: {MATCH_THRESHOLD})")
-        if best_template_name:
-            print(f"  [DEBUG] Best matching template: {best_template_name}")
-    
-    if best_confidence >= MATCH_THRESHOLD:
-        if DEBUG_MODE:
-            print(f"  [DEBUG] Button found using template: {best_template_name}")
-        
-        h, w = best_size
-        center_x = best_location[0] + w // 2
-        center_y = best_location[1] + h // 2
-        
-        if DEBUG_MODE:
-            cv2.rectangle(screen, 
-                         (best_location[0], best_location[1]), 
-                         (best_location[0]+w, best_location[1]+h), 
-                         (0, 0, 255), 3)
-        
-        return (center_x, center_y), screen
-    
-    return None, screen
-
-# -----------------------------
-# IMPROVED CLUSTERING & COUNTING
-# -----------------------------
-def count_stars_per_card(star_points, template_shape):
-    if not star_points or not template_shape:
-        return []
-    
-    # Sort all points by X coordinate (left to right)
-    sorted_points = sorted(star_points, key=lambda p: p[0])
-    
-    # Group stars into cards based on horizontal gaps
-    cards = []
-    current_card = [sorted_points[0]]
-    
-    # Calculate expected spacing between stars within a card
-    # Stars within a card should be close together
-    star_width = template_shape[1]
-    card_gap_threshold = star_width * 3  # Gap between cards is much larger
-    
-    for i in range(1, len(sorted_points)):
-        prev_x = sorted_points[i-1][0]
-        curr_x = sorted_points[i][0]
-        
-        # If gap is large, it's a new card
-        if curr_x - prev_x > card_gap_threshold:
-            cards.append(current_card)
-            current_card = [sorted_points[i]]
-        else:
-            current_card.append(sorted_points[i])
-    
-    # Don't forget the last card
-    if current_card:
-        cards.append(current_card)
-    
-    # Count stars in each card by looking at unique horizontal positions
-    stars_per_card = []
-    for card_stars in cards:
-        # Sort by X within this card
-        card_stars = sorted(card_stars, key=lambda p: p[0])
-        
-        # Group stars that are at the same horizontal position (same column)
-        unique_x_positions = []
-        for x, y in card_stars:
-            # Check if this X position is already recorded (within tolerance)
-            is_new = True
-            for existing_x in unique_x_positions:
-                if abs(x - existing_x) < star_width * 0.5:
-                    is_new = False
+    if target_temps:
+        char_pts, char_shape, char_name, _ = find_scaled(screen_gray, target_temps, 0.80)
+        for (cx, cy) in char_pts:
+            for fx in five_star_columns:
+                if abs(cx - fx) < 150:
+                    target_is_high_tier = True
+                    target_name_found = char_name
+                    # position and name for debug
+                    target_info = {"name": char_name, "pos": (cx, cy), "shape": char_shape}
                     break
-            if is_new:
-                unique_x_positions.append(x)
-        
-        stars_per_card.append(len(unique_x_positions))
-    
-    return stars_per_card
+
+    # --- OUTPUT LOGIC ---
+    if not target_temps:
+        return has_enough_fives, f"Success: {total_fives} 5* cards found.", total_fives, None
+    else:
+        if has_enough_fives and target_is_high_tier:
+            return True, f"SUCCESS!: {target_name_found} is 5* and there are {total_fives} in total.", total_fives, target_info
+            
+    return False, f"Searching... (5* detected: {total_fives}/{args.min_5_star_cards})", total_fives, target_info
+
+# -----------------------------
+# ACTIONS, AVOID BOT DETECTION RANDOMIZER
+# -----------------------------
+def human_click(pos, shape):
+    # randomized clicking to avoid automated behavior detection.
+    tx = pos[0] + random.randint(10, shape[1]-10)
+    ty = pos[1] + random.randint(10, shape[0]-10)
+    # Move to target
+    pyautogui.moveTo(tx, ty, duration=random.uniform(0.4, 0.8), tween=pyautogui.easeOutQuad)
+    pyautogui.click()
+
+def load_temps(pattern):
+    # Loads all PNG files matching the pattern as grayscale templates.
+    return [(os.path.basename(f), cv2.imread(f, 0)) for f in glob.glob(pattern) if cv2.imread(f, 0) is not None]
 
 # -----------------------------
 # MAIN LOOP
 # -----------------------------
-print(f"[*] Reroller started! Press '{EXIT_KEY.upper()}' or Ctrl+C at any time to stop.\n")
+def main():
+    star_temps = load_temps(STAR_PATTERN)
+    btn_temps = load_temps(BTN_PATTERN)
+    target_temps = load_temps(os.path.join(TARGET_CHARS_DIR, "*.png"))
 
-attempt = 0
-try:
-    while attempt < MAX_ATTEMPTS:
-        # Check if user wants to exit
-        if should_exit:
-            print("[X] Script stopped by user.")
-            break
-            
+    print(f"Starting... {'Target Character Mode' if target_temps else 'General REROLL Mode'}")
+    print(f"Exit key set to: {args.exit_key.upper()}")
+    attempt = 0
+
+    while attempt < args.max_attempts and not keyboard.is_pressed('esc'):
         attempt += 1
-        print(f"\nAttempt #{attempt}... waiting for button to appear.")
+        print(f"\n[Attempt {attempt}/{args.max_attempts}] Scanning...")
+        
+        # Capture screen
+        img = pyautogui.screenshot()
+        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Wait for button with timeout
-        button_pos = None
-        screen = None
-        wait_iterations = 0
-        max_wait_iterations = 60  # 30 seconds (60 * 0.5s)
+        # Look for stars
+        s_pts, s_shape, _, _ = find_scaled(gray, star_temps, args.match_threshold)
         
-        while button_pos is None:
-            if should_exit:
-                print("[X] Script stopped by user.")
-                break
-            
-            # Save debug images on first check
-            save_debug = (wait_iterations == 0 and attempt == 1)
-            button_pos, screen = find_button_on_screen(screen, save_debug=save_debug)
-            
-            if button_pos is None:
-                wait_iterations += 1
-                if wait_iterations >= max_wait_iterations:
-                    print("[!] Timeout: Button not found after 30 seconds.")
-                    print("[!] Tips:")
-                    print("    - Make sure the game window is visible")
-                    print("    - Add more button templates (recruit_button2.png, etc.)")
-                    print("    - Look at the debug images in the screenshots folder")
-                    print("    - Try recapturing templates at the current window size")
-                    should_exit = True
-                    break
-                time.sleep(0.5)
-        
-        if should_exit:
-            break
-        
-        # Scan stars
-        star_points, template_shape, annotated_screen = find_stars_on_screen()
-        stars_per_card = count_stars_per_card(star_points, template_shape)
-        total_5_star_cards = sum(1 for s in stars_per_card if s >= 5)
-        
-        print(f"Stars per card: {stars_per_card} | 5-star cards: {total_5_star_cards}")
-        
-        # Save debug screenshot with card labels
-        if DEBUG_MODE:
-            # Add text labels for each detected card count
-            for idx, count in enumerate(stars_per_card):
-                cv2.putText(annotated_screen, f"Card {idx+1}: {count} stars", 
-                           (10, 30 + idx*25), cv2.FONT_HERSHEY_SIMPLEX, 
-                           0.6, (0, 255, 255), 2)
-            
-            filename = f"{SCREENSHOT_DIR}/attempt_{attempt:03d}.png"
-            cv2.imwrite(filename, annotated_screen)
-            print(f"Debug screenshot saved: {filename}")
+        # Validate Victory Conditions
+        success, msg, fives_count, target_info = check_victory(gray, s_pts, s_shape, target_temps)
 
-        if total_5_star_cards >= MIN_5_STAR_CARDS:
-            print("[SUCCESS] Desired roll achieved! Stopping script.")
+        # Save screenshot if debug is active
+        if args.debug_mode == 'true':
+            debug_frame = frame.copy()
+            
+            # Draw detected stars
+            for (x, y) in s_pts:
+                cv2.rectangle(debug_frame, (x, y), (x + s_shape[1], y + s_shape[0]), (0, 255, 0), 2)
+            
+            # Draw the target
+            if target_info:
+                tx, ty = target_info["pos"]
+                tw, th = target_info["shape"][1], target_info["shape"][0]
+                # box
+                cv2.rectangle(debug_frame, (tx, ty), (tx + tw, ty + th), (255, 0, 0), 3)
+                # name
+                cv2.putText(debug_frame, f"TARGET: {target_info['name']}", (tx, ty - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+            # count text
+            cv2.putText(debug_frame, f"5* Cards: {fives_count}", (10, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
+            cv2.imwrite(f"{DEBUG_DIR}/attempt_{attempt:04d}.png", debug_frame)
+            
+        print(f" -> {msg}")
+
+        if success:
+            print("¡SUCCESS!")
             break
 
-        if should_exit:
-            break
-            
-        print(f"Clicking re-recruit button at {button_pos}...")
-        pyautogui.click(*button_pos)
-        
-        # Wait with periodic exit checks
-        for _ in range(int(ROLL_DELAY * 10)):
-            if should_exit:
-                break
-            time.sleep(0.1)
+        # If no success, look for the "Recruit" button to try again
+        b_pts, b_shape, _, _ = find_scaled(gray, btn_temps, args.match_threshold)
+        if b_pts:
+            human_click(b_pts[0], b_shape)
+            # Randomized wait because of bot detection
+            time.sleep(args.roll_delay + random.uniform(0, 1))
+        else:
+            print("Retrying scan...")
+            time.sleep(2)
+    if attempt >= args.max_attempts:
+        print(f"\nMaximum attempts ({args.max_attempts}) reached. Stopping script.")
 
-except KeyboardInterrupt:
-    print("\n[!] Ctrl+C detected! Exiting...")
-finally:
-    print("\n[DONE] Rerolling complete.")
-    keyboard.unhook_all()  # Clean up keyboard listener
+if __name__ == "__main__":
+    main()
